@@ -12,9 +12,10 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+import inspect
 import os
 from textwrap import dedent
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Literal
 from unittest.mock import MagicMock, patch
 
 import mcp
@@ -23,7 +24,7 @@ import PIL.Image
 import pytest
 
 from smolagents.agent_types import _AGENT_TYPE_MAPPING
-from smolagents.tools import AUTHORIZED_TYPES, Tool, ToolCollection, launch_gradio_demo, tool
+from smolagents.tools import AUTHORIZED_TYPES, Tool, ToolCollection, launch_gradio_demo, tool, validate_tool_arguments
 
 from .utils.markers import require_run_all
 
@@ -81,6 +82,46 @@ class ToolTesterMixin:
 
 
 class TestTool:
+    @pytest.mark.parametrize(
+        "type_value, should_raise_error, error_contains",
+        [
+            # Valid cases
+            ("string", False, None),
+            (["string", "number"], False, None),
+            # Invalid cases
+            ("invalid_type", ValueError, "must be one of"),
+            (["string", "invalid_type"], ValueError, "must be one of"),
+            ([123, "string"], TypeError, "when type is a list, all elements must be strings"),
+            (123, TypeError, "must be a string or list of strings"),
+        ],
+    )
+    def test_tool_input_type_validation(self, type_value, should_raise_error, error_contains):
+        """Test the validation of the type property in tool inputs."""
+
+        # Define a tool class with the test type value
+        def create_tool():
+            class TestTool(Tool):
+                name = "test_tool"
+                description = "A tool for testing type validation"
+                inputs = {"text": {"type": type_value, "description": "Some input"}}
+                output_type = "string"
+
+                def forward(self, text) -> str:
+                    return text
+
+            return TestTool()
+
+        # Check if we expect this to raise an exception
+        if should_raise_error:
+            with pytest.raises(should_raise_error) as exc_info:
+                create_tool()
+            # Verify the error message contains expected text
+            assert error_contains in str(exc_info.value)
+        else:
+            # Should not raise an exception
+            tool = create_tool()
+            assert isinstance(tool, Tool)
+
     def test_tool_init_with_decorator(self):
         @tool
         def coolfunc(a: str, b: int) -> float:
@@ -225,7 +266,7 @@ class TestTool:
             inputs = {"string_input": {"type": "string", "description": "input description"}}
             output_type = "string"
 
-            def __init__(self, url: Optional[str] = "none"):
+            def __init__(self, url: str | None = "none"):
                 super().__init__(self)
                 self.url = url
 
@@ -290,7 +331,7 @@ class TestTool:
                     },
                 }
 
-                def forward(self, location: str, celsius: Optional[bool] = False) -> str:
+                def forward(self, location: str, celsius: bool | None = False) -> str:
                     return "The weather is UNGODLY with torrential rains and temperatures below -10°C"
 
             GetWeatherTool()
@@ -298,7 +339,7 @@ class TestTool:
 
     def test_tool_from_decorator_optional_args(self):
         @tool
-        def get_weather(location: str, celsius: Optional[bool] = False) -> str:
+        def get_weather(location: str, celsius: bool | None = False) -> str:
             """
             Get weather in the next days at given location.
             Secretly this tool does not care about the location, it hates the weather everywhere.
@@ -328,7 +369,7 @@ class TestTool:
                 }
                 output_type = "string"
 
-                def forward(self, location: str, celsius: Optional[bool] = False) -> str:
+                def forward(self, location: str, celsius: bool | None = False) -> str:
                     return "The weather is UNGODLY with torrential rains and temperatures below -10°C"
 
             GetWeatherTool()
@@ -406,7 +447,7 @@ class TestTool:
 
     def test_tool_supports_array(self):
         @tool
-        def get_weather(locations: List[str], months: Optional[Tuple[str, str]] = None) -> Dict[str, float]:
+        def get_weather(locations: list[str], months: tuple[str, str] | None = None) -> dict[str, float]:
             """
             Get weather in the next days at given locations.
 
@@ -418,6 +459,49 @@ class TestTool:
 
         assert get_weather.inputs["locations"]["type"] == "array"
         assert get_weather.inputs["months"]["type"] == "array"
+
+    def test_tool_supports_string_literal(self):
+        @tool
+        def get_weather(unit: Literal["celsius", "fahrenheit"] = "celsius") -> None:
+            """
+            Get weather in the next days at given location.
+
+            Args:
+                unit: The unit of temperature
+            """
+            return
+
+        assert get_weather.inputs["unit"]["type"] == "string"
+        assert get_weather.inputs["unit"]["enum"] == ["celsius", "fahrenheit"]
+
+    def test_tool_supports_numeric_literal(self):
+        @tool
+        def get_choice(choice: Literal[1, 2, 3]) -> None:
+            """
+            Get choice based on the provided numeric literal.
+
+            Args:
+                choice: The numeric choice to be made.
+            """
+            return
+
+        assert get_choice.inputs["choice"]["type"] == "integer"
+        assert get_choice.inputs["choice"]["enum"] == [1, 2, 3]
+
+    def test_tool_supports_nullable_literal(self):
+        @tool
+        def get_choice(choice: Literal[1, 2, 3, None]) -> None:
+            """
+            Get choice based on the provided value.
+
+            Args:
+                choice: The numeric choice to be made.
+            """
+            return
+
+        assert get_choice.inputs["choice"]["type"] == "integer"
+        assert get_choice.inputs["choice"]["nullable"] is True
+        assert get_choice.inputs["choice"]["enum"] == [1, 2, 3]
 
     def test_saving_tool_produces_valid_pyhon_code_with_multiline_description(self, tmp_path):
         @tool
@@ -432,27 +516,6 @@ class TestTool:
             return
 
         get_weather.save(tmp_path)
-        with open(os.path.join(tmp_path, "tool.py"), "r", encoding="utf-8") as f:
-            source_code = f.read()
-            compile(source_code, f.name, "exec")
-
-    def test_saving_tool_produces_valid_python_code_with_complex_name(self, tmp_path):
-        # Test one cannot save tool with additional args in init
-        class FailTool(Tool):
-            name = 'spe"\rcific'
-            description = """test \n\r
-            description"""
-            inputs = {"string_input": {"type": "string", "description": "input description"}}
-            output_type = "string"
-
-            def __init__(self):
-                super().__init__(self)
-
-            def forward(self, string_input):
-                return "foo"
-
-        fail_tool = FailTool()
-        fail_tool.save(tmp_path)
         with open(os.path.join(tmp_path, "tool.py"), "r", encoding="utf-8") as f:
             source_code = f.read()
             compile(source_code, f.name, "exec")
@@ -473,9 +536,74 @@ class TestTool:
         tool = request.getfixturevalue(fixture_name)
         result = tool.to_dict()
         # Check the Optional type annotation is preserved
-        assert "optional_text: Optional[str] = None" in result["code"]
+        assert "optional_text: str | None = None" in result["code"]
         # Check that the input is marked as nullable in the code
         assert "'nullable': True" in result["code"]
+
+    def test_from_dict_roundtrip(self, example_tool):
+        # Convert to dict
+        tool_dict = example_tool.to_dict()
+        # Create from dict
+        recreated_tool = Tool.from_dict(tool_dict)
+        # Verify properties
+        assert recreated_tool.name == example_tool.name
+        assert recreated_tool.description == example_tool.description
+        assert recreated_tool.inputs == example_tool.inputs
+        assert recreated_tool.output_type == example_tool.output_type
+        # Verify functionality
+        test_input = "Hello, world!"
+        assert recreated_tool(test_input) == test_input.upper()
+
+    def test_tool_from_dict_invalid(self):
+        # Missing code key
+        with pytest.raises(ValueError) as e:
+            Tool.from_dict({"name": "invalid_tool"})
+        assert "must contain 'code' key" in str(e)
+
+    def test_tool_decorator_preserves_original_function(self):
+        # Define a test function with type hints and docstring
+        def test_function(items: list[str]) -> str:
+            """Join a list of strings.
+            Args:
+                items: A list of strings to join
+            Returns:
+                The joined string
+            """
+            return ", ".join(items)
+
+        # Store original function signature, name, and source
+        original_signature = inspect.signature(test_function)
+        original_name = test_function.__name__
+        original_docstring = test_function.__doc__
+
+        # Create a tool from the function
+        test_tool = tool(test_function)
+
+        # Check that the original function is unchanged
+        assert original_signature == inspect.signature(test_function)
+        assert original_name == test_function.__name__
+        assert original_docstring == test_function.__doc__
+
+        # Verify that the tool's forward method has a different signature (it has 'self')
+        tool_forward_sig = inspect.signature(test_tool.forward)
+        assert list(tool_forward_sig.parameters.keys())[0] == "self"
+
+        # Original function should not have 'self' parameter
+        assert "self" not in original_signature.parameters
+
+    def test_tool_with_union_type_return(self):
+        @tool
+        def union_type_return_tool_function(param: int) -> str | bool:
+            """
+            Tool with output union type.
+
+            Args:
+                param: Input parameter.
+            """
+            return str(param) if param > 0 else False
+
+        assert isinstance(union_type_return_tool_function, Tool)
+        assert union_type_return_tool_function.output_type == "any"
 
 
 @pytest.fixture
@@ -499,7 +627,7 @@ def mock_smolagents_adapter():
 
 class TestToolCollection:
     def test_from_mcp(self, mock_server_parameters, mock_mcp_adapt, mock_smolagents_adapter):
-        with ToolCollection.from_mcp(mock_server_parameters) as tool_collection:
+        with ToolCollection.from_mcp(mock_server_parameters, trust_remote_code=True) as tool_collection:
             assert isinstance(tool_collection, ToolCollection)
             assert len(tool_collection.tools) == 2
             assert "tool1" in tool_collection.tools
@@ -525,10 +653,47 @@ class TestToolCollection:
             args=["-c", mcp_server_script],
         )
 
-        with ToolCollection.from_mcp(mcp_server_params) as tool_collection:
+        with ToolCollection.from_mcp(mcp_server_params, trust_remote_code=True) as tool_collection:
             assert len(tool_collection.tools) == 1, "Expected 1 tool"
             assert tool_collection.tools[0].name == "echo_tool", "Expected tool name to be 'echo_tool'"
             assert tool_collection.tools[0](text="Hello") == "Hello", "Expected tool to echo the input text"
+
+    def test_integration_from_mcp_with_streamable_http(self):
+        import subprocess
+        import time
+
+        # define the most simple mcp server with one tool that echoes the input text
+        mcp_server_script = dedent("""\
+            from mcp.server.fastmcp import FastMCP
+
+            mcp = FastMCP("Echo Server", host="127.0.0.1", port=8000)
+
+            @mcp.tool()
+            def echo_tool(text: str) -> str:
+                return text
+
+            mcp.run(transport="streamable-http")
+        """).strip()
+
+        # start the SSE mcp server in a subprocess
+        server_process = subprocess.Popen(
+            ["python", "-c", mcp_server_script],
+        )
+
+        # wait for the server to start
+        time.sleep(1)
+
+        try:
+            with ToolCollection.from_mcp(
+                {"url": "http://127.0.0.1:8000/mcp", "transport": "streamable-http"}, trust_remote_code=True
+            ) as tool_collection:
+                assert len(tool_collection.tools) == 1, "Expected 1 tool"
+                assert tool_collection.tools[0].name == "echo_tool", "Expected tool name to be 'echo_tool'"
+                assert tool_collection.tools[0](text="Hello") == "Hello", "Expected tool to echo the input text"
+        finally:
+            # clean up the process when test is done
+            server_process.kill()
+            server_process.wait()
 
     def test_integration_from_mcp_with_sse(self):
         import subprocess
@@ -556,7 +721,9 @@ class TestToolCollection:
         time.sleep(1)
 
         try:
-            with ToolCollection.from_mcp({"url": "http://127.0.0.1:8000/sse"}) as tool_collection:
+            with ToolCollection.from_mcp(
+                {"url": "http://127.0.0.1:8000/sse", "transport": "sse"}, trust_remote_code=True
+            ) as tool_collection:
                 assert len(tool_collection.tools) == 1, "Expected 1 tool"
                 assert tool_collection.tools[0].name == "echo_tool", "Expected tool name to be 'echo_tool'"
                 assert tool_collection.tools[0](text="Hello") == "Hello", "Expected tool to echo the input text"
@@ -572,3 +739,33 @@ def test_launch_gradio_demo_does_not_raise(tool_fixture_name, request):
     with patch("gradio.Interface.launch") as mock_launch:
         launch_gradio_demo(tool)
     assert mock_launch.call_count == 1
+
+
+@pytest.mark.parametrize(
+    "tool_input_type, expected_input, expects_error",
+    [
+        (bool, True, False),
+        (str, "b", False),
+        (int, 1, False),
+        (list, ["a", "b"], False),
+        (list[str], ["a", "b"], False),
+        (dict[str, str], {"a": "b"}, False),
+        (dict[str, str], "b", True),
+        (bool, "b", True),
+    ],
+)
+def test_validate_tool_arguments(tool_input_type, expected_input, expects_error):
+    @tool
+    def test_tool(argument_a: tool_input_type) -> str:
+        """Fake tool
+
+        Args:
+            argument_a: The input
+        """
+        return argument_a
+
+    error = validate_tool_arguments(test_tool, {"argument_a": expected_input})
+    if expects_error:
+        assert error is not None
+    else:
+        assert error is None

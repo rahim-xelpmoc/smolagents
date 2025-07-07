@@ -16,13 +16,12 @@ from smolagents import (
     AgentError,
     CodeAgent,
     GoogleSearchTool,
-    HfApiModel,
+    InferenceClientModel,
     LiteLLMModel,
     PythonInterpreterTool,
     ToolCallingAgent,
     VisitWebpageTool,
 )
-from smolagents.agents import ActionStep
 
 
 load_dotenv()
@@ -48,15 +47,21 @@ def parse_arguments():
     parser.add_argument(
         "--model-type",
         type=str,
-        default="HfApiModel",
-        choices=["LiteLLMModel", "HfApiModel"],
-        help="The model type to use (LiteLLMModel or HfApiModel)",
+        default="InferenceClientModel",
+        choices=["LiteLLMModel", "InferenceClientModel"],
+        help="The model type to use (LiteLLMModel or InferenceClientModel)",
     )
     parser.add_argument(
         "--model-id",
         type=str,
         required=True,
         help="The model ID to use for the specified model type",
+    )
+    parser.add_argument(
+        "--provider",
+        type=str,
+        default="hf-inference",
+        help="The provider for InferenceClientModel - will not be used for LiteLLMModel",
     )
     parser.add_argument(
         "--agent-action-type",
@@ -74,7 +79,6 @@ def parse_arguments():
     parser.add_argument(
         "--push-answers-to-hub",
         action="store_true",
-        default=False,
         help="Push the answers to the hub",
     )
     parser.add_argument(
@@ -107,8 +111,15 @@ def serialize_agent_error(obj):
 def append_answer(entry: dict, jsonl_file: str) -> None:
     jsonl_file = Path(jsonl_file)
     jsonl_file.parent.mkdir(parents=True, exist_ok=True)
+
+    def convert_to_serializable(obj):
+        if hasattr(obj, "dict"):
+            return obj.dict()
+        else:
+            raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
+
     with APPEND_ANSWER_LOCK, open(jsonl_file, "a", encoding="utf-8") as fp:
-        fp.write(json.dumps(entry) + "\n")
+        fp.write(json.dumps(entry, default=convert_to_serializable) + "\n")
     assert os.path.exists(jsonl_file), "File not found!"
 
 
@@ -141,22 +152,20 @@ def answer_single_question(example, model, answers_file, action_type):
     try:
         if action_type == "vanilla":
             answer = agent([{"role": "user", "content": augmented_question}]).content
-            token_count = agent.last_output_token_count
+            token_counts = agent.monitor.get_total_token_counts()
             intermediate_steps = answer
         else:
             # Run agent 🚀
             answer = str(agent.run(augmented_question))
-            token_count = agent.monitor.get_total_token_counts()
-            # Remove memory from logs to make them more compact.
-            for step in agent.memory.steps:
-                if isinstance(step, ActionStep):
-                    step.agent_memory = None
-            intermediate_steps = str(agent.memory.steps)
+            token_counts = agent.monitor.get_total_token_counts()
+            intermediate_steps = [dict(message) for message in agent.write_memory_to_messages()]
 
         end_time = time.time()
     except Exception as e:
         print("Error on ", augmented_question, e)
         intermediate_steps = []
+        token_counts = {"input": 0, "output": 0}
+        answer = str(e)
     end_time = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     annotated_example = {
         "model_id": model.model_id,
@@ -169,7 +178,7 @@ def answer_single_question(example, model, answers_file, action_type):
         "intermediate_steps": intermediate_steps,
         "start_time": start_time,
         "end_time": end_time,
-        "token_counts": token_count,
+        "token_counts": token_counts,
     }
     append_answer(annotated_example, answers_file)
 
@@ -233,7 +242,7 @@ if __name__ == "__main__":
             max_completion_tokens=8192,
         )
     else:
-        model = HfApiModel(model_id=args.model_id, provider="together", max_tokens=8192)
+        model = InferenceClientModel(model_id=args.model_id, provider=args.provider, max_tokens=8192)
 
     answer_questions(
         eval_ds,
