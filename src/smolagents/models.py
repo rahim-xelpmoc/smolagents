@@ -15,6 +15,7 @@ import importlib.util
 import json
 import logging
 import os
+import ast
 import uuid
 import warnings
 from copy import deepcopy
@@ -23,13 +24,20 @@ from enum import Enum
 from typing import TYPE_CHECKING, Any, Dict, List, Optional, Union
 
 from .tools import Tool
-from .utils import _is_package_available, encode_image_base64, make_image_url, parse_json_blob
+from .utils import (
+    _is_package_available,
+    encode_image_base64,
+    make_image_url,
+    parse_json_blob,
+)
 
 
 if TYPE_CHECKING:
     from transformers import StoppingCriteriaList
 
 logger = logging.getLogger(__name__)
+
+GEMINI_SYSTEM_TOOLCALLING_PROMPT = "you are a helpful tool calling agent. You can solve the user query by calling the tools. You are given access to some tools. when you feel you have the answer of the users query you have to call final_answer tool"
 
 DEFAULT_JSONAGENT_REGEX_GRAMMAR = {
     "type": "regex",
@@ -40,6 +48,13 @@ DEFAULT_CODEAGENT_REGEX_GRAMMAR = {
     "type": "regex",
     "value": "Thought: .+?\\nCode:\\n```(?:py|python)?\\n(?:.|\\s)+?\\n```<end_code>",
 }
+
+
+try:
+    from google import genai
+    from google.genai import types
+except:
+    pass
 
 
 def get_dict_from_nested_dataclasses(obj, ignore_key=None):
@@ -95,15 +110,22 @@ class ChatMessage:
     def from_hf_api(cls, message, raw) -> "ChatMessage":
         tool_calls = None
         if getattr(message, "tool_calls", None) is not None:
-            tool_calls = [ChatMessageToolCall.from_hf_api(tool_call) for tool_call in message.tool_calls]
-        return cls(role=message.role, content=message.content, tool_calls=tool_calls, raw=raw)
+            tool_calls = [
+                ChatMessageToolCall.from_hf_api(tool_call)
+                for tool_call in message.tool_calls
+            ]
+        return cls(
+            role=message.role, content=message.content, tool_calls=tool_calls, raw=raw
+        )
 
     @classmethod
     def from_dict(cls, data: dict, raw: Any | None = None) -> "ChatMessage":
         if data.get("tool_calls"):
             tool_calls = [
                 ChatMessageToolCall(
-                    function=ChatMessageToolCallDefinition(**tc["function"]), id=tc["id"], type=tc["type"]
+                    function=ChatMessageToolCallDefinition(**tc["function"]),
+                    id=tc["id"],
+                    type=tc["type"],
                 )
                 for tc in data["tool_calls"]
             ]
@@ -192,7 +214,9 @@ def get_clean_message_list(
     for message in message_list:
         role = message["role"]
         if role not in MessageRole.roles():
-            raise ValueError(f"Incorrect role {role}, only {MessageRole.roles()} are supported for now.")
+            raise ValueError(
+                f"Incorrect role {role}, only {MessageRole.roles()} are supported for now."
+            )
 
         if role in role_conversions:
             message["role"] = role_conversions[role]
@@ -200,19 +224,30 @@ def get_clean_message_list(
         if isinstance(message["content"], list):
             for element in message["content"]:
                 if element["type"] == "image":
-                    assert not flatten_messages_as_text, f"Cannot use images with {flatten_messages_as_text=}"
+                    assert (
+                        not flatten_messages_as_text
+                    ), f"Cannot use images with {flatten_messages_as_text=}"
                     if convert_images_to_image_urls:
                         element.update(
                             {
                                 "type": "image_url",
-                                "image_url": {"url": make_image_url(encode_image_base64(element.pop("image")))},
+                                "image_url": {
+                                    "url": make_image_url(
+                                        encode_image_base64(element.pop("image"))
+                                    )
+                                },
                             }
                         )
                     else:
                         element["image"] = encode_image_base64(element["image"])
 
-        if len(output_message_list) > 0 and message["role"] == output_message_list[-1]["role"]:
-            assert isinstance(message["content"], list), "Error: wrong content:" + str(message["content"])
+        if (
+            len(output_message_list) > 0
+            and message["role"] == output_message_list[-1]["role"]
+        ):
+            assert isinstance(message["content"], list), "Error: wrong content:" + str(
+                message["content"]
+            )
             if flatten_messages_as_text:
                 output_message_list[-1]["content"] += message["content"][0]["text"]
             else:
@@ -226,7 +261,9 @@ def get_clean_message_list(
     return output_message_list
 
 
-def get_tool_call_from_text(text: str, tool_name_key: str, tool_arguments_key: str) -> ChatMessageToolCall:
+def get_tool_call_from_text(
+    text: str, tool_name_key: str, tool_arguments_key: str
+) -> ChatMessageToolCall:
     tool_call_dictionary, _ = parse_json_blob(text)
     try:
         tool_name = tool_call_dictionary[tool_name_key]
@@ -239,7 +276,9 @@ def get_tool_call_from_text(text: str, tool_name_key: str, tool_arguments_key: s
     return ChatMessageToolCall(
         id=str(uuid.uuid4()),
         type="function",
-        function=ChatMessageToolCallDefinition(name=tool_name, arguments=tool_arguments),
+        function=ChatMessageToolCallDefinition(
+            name=tool_name, arguments=tool_arguments
+        ),
     )
 
 
@@ -300,7 +339,9 @@ class Model:
         if tools_to_call_from:
             completion_kwargs.update(
                 {
-                    "tools": [get_tool_json_schema(tool) for tool in tools_to_call_from],
+                    "tools": [
+                        get_tool_json_schema(tool) for tool in tools_to_call_from
+                    ],
                     "tool_choice": "required",
                 }
             )
@@ -386,8 +427,12 @@ class Model:
                 if k not in ["last_input_token_count", "last_output_token_count"]
             }
         )
-        model_instance.last_input_token_count = model_dictionary.pop("last_input_token_count", None)
-        model_instance.last_output_token_count = model_dictionary.pop("last_output_token_count", None)
+        model_instance.last_input_token_count = model_dictionary.pop(
+            "last_input_token_count", None
+        )
+        model_instance.last_output_token_count = model_dictionary.pop(
+            "last_output_token_count", None
+        )
         return model_instance
 
 
@@ -402,7 +447,9 @@ class VLLMModel(Model):
 
     def __init__(self, model_id, **kwargs):
         if not _is_package_available("vllm"):
-            raise ModuleNotFoundError("Please install 'vllm' extra to use VLLMModel: `pip install 'smolagents[vllm]'`")
+            raise ModuleNotFoundError(
+                "Please install 'vllm' extra to use VLLMModel: `pip install 'smolagents[vllm]'`"
+            )
 
         from vllm import LLM
         from vllm.transformers_utils.tokenizer import get_tokenizer
@@ -418,7 +465,10 @@ class VLLMModel(Model):
         import gc
 
         import torch
-        from vllm.distributed.parallel_state import destroy_distributed_environment, destroy_model_parallel
+        from vllm.distributed.parallel_state import (
+            destroy_distributed_environment,
+            destroy_model_parallel,
+        )
 
         destroy_model_parallel()
         if self.model is not None:
@@ -486,7 +536,9 @@ class VLLMModel(Model):
         )
         if tools_to_call_from:
             chat_message.tool_calls = [
-                get_tool_call_from_text(output_text, self.tool_name_key, self.tool_arguments_key)
+                get_tool_call_from_text(
+                    output_text, self.tool_name_key, self.tool_arguments_key
+                )
             ]
         return chat_message
 
@@ -537,7 +589,9 @@ class MLXModel(Model):
         trust_remote_code: bool = False,
         **kwargs,
     ):
-        super().__init__(flatten_messages_as_text=True, **kwargs)  # mlx-lm doesn't support vision models
+        super().__init__(
+            flatten_messages_as_text=True, **kwargs
+        )  # mlx-lm doesn't support vision models
         if not _is_package_available("mlx_lm"):
             raise ModuleNotFoundError(
                 "Please install 'mlx-lm' extra to use 'MLXModel': `pip install 'smolagents[mlx-lm]'`"
@@ -545,7 +599,9 @@ class MLXModel(Model):
         import mlx_lm
 
         self.model_id = model_id
-        self.model, self.tokenizer = mlx_lm.load(model_id, tokenizer_config={"trust_remote_code": trust_remote_code})
+        self.model, self.tokenizer = mlx_lm.load(
+            model_id, tokenizer_config={"trust_remote_code": trust_remote_code}
+        )
         self.stream_generate = mlx_lm.stream_generate
         self.tool_name_key = tool_name_key
         self.tool_arguments_key = tool_arguments_key
@@ -580,7 +636,9 @@ class MLXModel(Model):
         self.last_input_token_count = len(prompt_ids)
         self.last_output_token_count = 0
         text = ""
-        for response in self.stream_generate(self.model, self.tokenizer, prompt=prompt_ids, **completion_kwargs):
+        for response in self.stream_generate(
+            self.model, self.tokenizer, prompt=prompt_ids, **completion_kwargs
+        ):
             self.last_output_token_count += 1
             text += response.text
             if any((stop_index := text.rfind(stop)) != -1 for stop in stops):
@@ -588,10 +646,16 @@ class MLXModel(Model):
                 break
 
         chat_message = ChatMessage(
-            role=MessageRole.ASSISTANT, content=text, raw={"out": text, "completion_kwargs": completion_kwargs}
+            role=MessageRole.ASSISTANT,
+            content=text,
+            raw={"out": text, "completion_kwargs": completion_kwargs},
         )
         if tools_to_call_from:
-            chat_message.tool_calls = [get_tool_call_from_text(text, self.tool_name_key, self.tool_arguments_key)]
+            chat_message.tool_calls = [
+                get_tool_call_from_text(
+                    text, self.tool_name_key, self.tool_arguments_key
+                )
+            ]
         return chat_message
 
 
@@ -645,7 +709,12 @@ class TransformersModel(Model):
     ):
         try:
             import torch
-            from transformers import AutoModelForCausalLM, AutoModelForImageTextToText, AutoProcessor, AutoTokenizer
+            from transformers import (
+                AutoModelForCausalLM,
+                AutoModelForImageTextToText,
+                AutoProcessor,
+                AutoTokenizer,
+            )
         except ModuleNotFoundError:
             raise ModuleNotFoundError(
                 "Please install 'transformers' extra to use 'TransformersModel': `pip install 'smolagents[transformers]'`"
@@ -680,7 +749,9 @@ class TransformersModel(Model):
                 torch_dtype=torch_dtype,
                 trust_remote_code=trust_remote_code,
             )
-            self.processor = AutoProcessor.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+            self.processor = AutoProcessor.from_pretrained(
+                model_id, trust_remote_code=trust_remote_code
+            )
             self._is_vlm = True
         except ValueError as e:
             if "Unrecognized configuration class" in str(e):
@@ -690,14 +761,20 @@ class TransformersModel(Model):
                     torch_dtype=torch_dtype,
                     trust_remote_code=trust_remote_code,
                 )
-                self.tokenizer = AutoTokenizer.from_pretrained(model_id, trust_remote_code=trust_remote_code)
+                self.tokenizer = AutoTokenizer.from_pretrained(
+                    model_id, trust_remote_code=trust_remote_code
+                )
             else:
                 raise e
         except Exception as e:
-            raise ValueError(f"Failed to load tokenizer and model for {model_id=}: {e}") from e
+            raise ValueError(
+                f"Failed to load tokenizer and model for {model_id=}: {e}"
+            ) from e
         super().__init__(flatten_messages_as_text=not self._is_vlm, **kwargs)
 
-    def make_stopping_criteria(self, stop_sequences: List[str], tokenizer) -> "StoppingCriteriaList":
+    def make_stopping_criteria(
+        self, stop_sequences: List[str], tokenizer
+    ) -> "StoppingCriteriaList":
         from transformers import StoppingCriteria, StoppingCriteriaList
 
         class StopOnStrings(StoppingCriteria):
@@ -710,9 +787,16 @@ class TransformersModel(Model):
                 self.stream = ""
 
             def __call__(self, input_ids, scores, **kwargs):
-                generated = self.tokenizer.decode(input_ids[0][-1], skip_special_tokens=True)
+                generated = self.tokenizer.decode(
+                    input_ids[0][-1], skip_special_tokens=True
+                )
                 self.stream += generated
-                if any([self.stream.endswith(stop_string) for stop_string in self.stop_strings]):
+                if any(
+                    [
+                        self.stream.endswith(stop_string)
+                        for stop_string in self.stop_strings
+                    ]
+                ):
                     return True
                 return False
 
@@ -749,7 +833,11 @@ class TransformersModel(Model):
         if hasattr(self, "processor"):
             prompt_tensor = self.processor.apply_chat_template(
                 messages,
-                tools=[get_tool_json_schema(tool) for tool in tools_to_call_from] if tools_to_call_from else None,
+                tools=(
+                    [get_tool_json_schema(tool) for tool in tools_to_call_from]
+                    if tools_to_call_from
+                    else None
+                ),
                 return_tensors="pt",
                 tokenize=True,
                 return_dict=True,
@@ -758,7 +846,11 @@ class TransformersModel(Model):
         else:
             prompt_tensor = self.tokenizer.apply_chat_template(
                 messages,
-                tools=[get_tool_json_schema(tool) for tool in tools_to_call_from] if tools_to_call_from else None,
+                tools=(
+                    [get_tool_json_schema(tool) for tool in tools_to_call_from]
+                    if tools_to_call_from
+                    else None
+                ),
                 return_tensors="pt",
                 return_dict=True,
                 add_generation_prompt=True if tools_to_call_from else False,
@@ -769,7 +861,10 @@ class TransformersModel(Model):
 
         if stop_sequences:
             stopping_criteria = self.make_stopping_criteria(
-                stop_sequences, tokenizer=self.processor if hasattr(self, "processor") else self.tokenizer
+                stop_sequences,
+                tokenizer=(
+                    self.processor if hasattr(self, "processor") else self.tokenizer
+                ),
             )
         else:
             stopping_criteria = None
@@ -781,9 +876,13 @@ class TransformersModel(Model):
         )
         generated_tokens = out[0, count_prompt_tokens:]
         if hasattr(self, "processor"):
-            output_text = self.processor.decode(generated_tokens, skip_special_tokens=True)
+            output_text = self.processor.decode(
+                generated_tokens, skip_special_tokens=True
+            )
         else:
-            output_text = self.tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            output_text = self.tokenizer.decode(
+                generated_tokens, skip_special_tokens=True
+            )
         self.last_input_token_count = count_prompt_tokens
         self.last_output_token_count = len(generated_tokens)
 
@@ -797,7 +896,9 @@ class TransformersModel(Model):
         )
         if tools_to_call_from:
             chat_message.tool_calls = [
-                get_tool_call_from_text(output_text, self.tool_name_key, self.tool_arguments_key)
+                get_tool_call_from_text(
+                    output_text, self.tool_name_key, self.tool_arguments_key
+                )
             ]
         return chat_message
 
@@ -806,16 +907,22 @@ class ApiModel(Model):
     def __init__(self, **kwargs):
         super().__init__(**kwargs)
 
-    def postprocess_message(self, message: ChatMessage, tools_to_call_from) -> ChatMessage:
+    def postprocess_message(
+        self, message: ChatMessage, tools_to_call_from
+    ) -> ChatMessage:
         """Sometimes APIs fail to properly parse a tool call: this function tries to parse."""
         message.role = MessageRole.ASSISTANT  # Overwrite role if needed
         if tools_to_call_from:
             if not message.tool_calls:
                 message.tool_calls = [
-                    get_tool_call_from_text(message.content, self.tool_name_key, self.tool_arguments_key)
+                    get_tool_call_from_text(
+                        message.content, self.tool_name_key, self.tool_arguments_key
+                    )
                 ]
             for tool_call in message.tool_calls:
-                tool_call.function.arguments = parse_json_if_needed(tool_call.function.arguments)
+                tool_call.function.arguments = parse_json_if_needed(
+                    tool_call.function.arguments
+                )
         return message
 
 
@@ -899,7 +1006,9 @@ class LiteLLMModel(ApiModel):
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens
         first_message = ChatMessage.from_dict(
-            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
+            response.choices[0].message.model_dump(
+                include={"role", "content", "tool_calls"}
+            ),
             raw=response,
         )
         return self.postprocess_message(first_message, tools_to_call_from)
@@ -964,7 +1073,9 @@ class HfApiModel(ApiModel):
         self.provider = provider
         if token is None:
             token = os.getenv("HF_TOKEN")
-        self.client = InferenceClient(self.model_id, provider=provider, token=token, timeout=timeout)
+        self.client = InferenceClient(
+            self.model_id, provider=provider, token=token, timeout=timeout
+        )
         self.custom_role_conversions = custom_role_conversions
 
     def __call__(
@@ -988,7 +1099,9 @@ class HfApiModel(ApiModel):
 
         self.last_input_token_count = response.usage.prompt_tokens
         self.last_output_token_count = response.usage.completion_tokens
-        first_message = ChatMessage.from_hf_api(response.choices[0].message, raw=response)
+        first_message = ChatMessage.from_hf_api(
+            response.choices[0].message, raw=response
+        )
         return self.postprocess_message(first_message, tools_to_call_from)
 
 
@@ -1038,7 +1151,12 @@ class OpenAIServerModel(ApiModel):
         self.custom_role_conversions = custom_role_conversions
         self.client_kwargs = client_kwargs or {}
         self.client_kwargs.update(
-            {"api_key": api_key, "base_url": api_base, "organization": organization, "project": project}
+            {
+                "api_key": api_key,
+                "base_url": api_base,
+                "organization": organization,
+                "project": project,
+            }
         )
         self.client = self.create_client()
 
@@ -1070,7 +1188,9 @@ class OpenAIServerModel(ApiModel):
         self.last_output_token_count = response.usage.completion_tokens
 
         first_message = ChatMessage.from_dict(
-            response.choices[0].message.model_dump(include={"role", "content", "tool_calls"}),
+            response.choices[0].message.model_dump(
+                include={"role", "content", "tool_calls"}
+            ),
             raw=response,
         )
         return self.postprocess_message(first_message, tools_to_call_from)
@@ -1132,6 +1252,171 @@ class AzureOpenAIServerModel(OpenAIServerModel):
         return openai.AzureOpenAI(**self.client_kwargs)
 
 
+def get_gemini_tool(tool: Tool):
+    name = tool.name
+    description = tool.description
+    inputs = tool.inputs
+    required = []
+    for arg, desc in inputs.items():
+        if "nullable" in desc:
+            desc.pop("nullable")
+        else:
+            required.append(arg)
+        if "type" in desc and desc["type"] == "any":
+            desc["type"] = "object"
+    output = {
+        "name": name,
+        "description": description,
+        "parameters": {"type": "object", "properties": inputs, "required": required},
+    }
+    return output
+
+def get_gemini_message_parts(messages: List[Dict[str, str]]):
+    messages_part = []
+    last_function_call = None
+    system_instruction = None
+    for message in messages:
+        if message["role"] == "system":
+            system_instruction = message["content"][0]["text"]
+        if message["role"] == "user":
+            parts = []
+            for part in message["content"]:
+                if part["type"] == "text":
+                    parts.append(types.Part.from_text(text=part["text"]))
+                    messages_part.append(types.Content(parts=parts, role="user"))
+                elif part["type"] == "image":
+                    messages_part.append(part["image"])
+
+        if message["role"] == "tool-call":
+            text = message["content"][0]["text"].strip()
+            text = text.replace("Calling tools:\n", "")
+            text = ast.literal_eval(text)[0]
+            last_function_call = text["function"]["name"]
+            if last_function_call=='python_interpreter':
+                messages_part.append(
+                    types.Content(
+                        parts=[
+                            types.Part.from_executable_code(
+                                code=text["function"]["arguments"],
+                                language="python",
+                            )
+                        ],role='model'
+                    )
+                )
+            else:
+                messages_part.append(
+                    types.Content(
+                        parts=[
+                            types.Part.from_function_call(
+                                name=text["function"]["name"],
+                                args=text["function"]["arguments"],
+                            )
+                        ],
+                        role='model'
+                    )
+                )
+        if message["role"] == "tool-response":
+            if last_function_call == "python_interpreter":
+                messages_part.append(
+                    types.Content(
+                        parts=[
+                            types.Part.from_code_execution_result(
+                                outcome='OUTCOME_OK',
+                                output=message["content"][0]["text"]
+                            )
+                        ],
+                        role='user'
+                    )
+                )
+            else:
+                messages_part.append(
+                    types.Content(
+                        parts=[
+                            types.Part.from_function_response(
+                                name=last_function_call,
+                                response={"result": message["content"][0]["text"]},
+                            )
+                        ],
+                        role='user'
+                    )
+                )
+    return messages_part,system_instruction
+
+class GeminiModel(ApiModel):
+    def __init__(
+        self,
+        model_id: str = "gemini-2.0-flash",
+        system_prompt: Optional[str] = None,
+        timeout: Optional[int] = 120,
+        custom_role_conversions: Optional[Dict[str, str]] = None,
+        is_code_agent: Optional[bool] = False,
+        **kwargs,
+    ):
+
+        super().__init__(**kwargs)
+        self.client = genai.Client(api_key=os.getenv("GOOGLE_API_KEY"))
+        self.model_id = model_id
+        self.timeout = timeout
+        self.custom_role_conversions = custom_role_conversions
+        self.is_code_agent = is_code_agent
+
+    def __call__(
+        self,
+        messages: List[Dict[str, str]],
+        stop_sequences: Optional[List[str]] = None,
+        grammar: Optional[str] = None,
+        tools_to_call_from: Optional[List[Tool]] = None,
+        
+        **kwargs,
+    ) -> ChatMessage:
+        # print("messages", messages)
+        messages_part,system_instructions =get_gemini_message_parts(messages)
+        if not self.is_code_agent:
+            system_instructions=GEMINI_SYSTEM_TOOLCALLING_PROMPT
+        tools_list = None
+        generation_config = None
+        if tools_to_call_from:
+            tools_list = []
+            for tool_ in tools_to_call_from:
+                tools_list.append(get_gemini_tool(tool_))
+            tools_list_ = types.Tool(function_declarations=tools_list)
+            generation_config = types.GenerateContentConfig(
+                tools=[tools_list_],
+                stop_sequences=stop_sequences,
+                system_instruction=system_instructions,
+            )
+        else:
+            generation_config = types.GenerateContentConfig(
+                stop_sequences=stop_sequences,
+                system_instruction=system_instructions,
+            )
+        # print(messages_part)
+        response = self.client.models.generate_content(
+            model=self.model_id, contents=messages_part, config=generation_config
+        )
+        # print(response)
+        output = ChatMessage(role="assistant", raw=response)
+        # print(response)
+        for part in response.candidates[0].content.parts:
+            if part.function_call:
+                function_call = part.function_call
+                function_name = function_call.name
+                arguments = function_call.args
+                output.tool_calls = [
+                    ChatMessageToolCall(
+                        function=ChatMessageToolCallDefinition(
+                            name=function_name, arguments=arguments
+                        ),
+                        id=str(uuid.uuid4()),
+                        type="function",
+                    )
+                ]
+            if part.text:
+                output.content = part.text
+
+        return output
+
+
 __all__ = [
     "MessageRole",
     "tool_role_conversions",
@@ -1146,4 +1431,6 @@ __all__ = [
     "VLLMModel",
     "AzureOpenAIServerModel",
     "ChatMessage",
+    "GeminiModel",
+    "get_gemini_tool",
 ]
